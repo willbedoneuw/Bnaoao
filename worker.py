@@ -453,8 +453,8 @@ async def pick_worker_for_login(verify: bool = True, exclude_id=None,
     """Choose the healthy enabled worker with the fewest accounts (= round-robin
     as accounts are added one at a time). Verifies health right before use.
     If exclude_id / exclude_ids are given, those workers are NOT considered
-    (used for "worker transfer": re-login the account on a server that is
-    DIFFERENT from the last TWO servers it lived on — current + previous).
+    (used for "worker transfer": re-login the account on a server it hasn't
+    used recently; the caller decides how many recent servers to exclude).
     Returns a worker dict or None if none are usable.
     """
     # Make sure a master row exists (creates it once if missing), but routing

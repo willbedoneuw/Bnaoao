@@ -363,11 +363,12 @@ def init():
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
         c.execute("ALTER TABLE accounts ADD COLUMN worker_id INTEGER")
-    # ---- migration: remember the PREVIOUS worker an account lived on, so a
-    # "worker transfer" can avoid the last TWO servers (current + previous),
-    # not just the current one. ----
-    if "prev_worker_id" not in cols:
-        c.execute("ALTER TABLE accounts ADD COLUMN prev_worker_id INTEGER")
+    # ---- migration: remember EVERY worker an account has lived on (ordered,
+    # JSON list). A "worker transfer" uses this to prefer a server the account
+    # has never been on, and to avoid the recently-used ones — for ANY number
+    # of workers, without ever getting stuck. ----
+    if "worker_history" not in cols:
+        c.execute("ALTER TABLE accounts ADD COLUMN worker_history TEXT")
     # ---- migration (v4): portable Rubika session blob (encrypted at rest) ----
     if "session_blob" not in cols:
         c.execute("ALTER TABLE accounts ADD COLUMN session_blob TEXT")
@@ -685,21 +686,44 @@ def count_accounts_on_worker(worker_id: int) -> int:
 
 def set_account_worker(account_id: int, worker_id):
     conn = _conn()
-    # When the owning worker actually CHANGES (e.g. a transfer), keep the old
-    # worker as prev_worker_id. This gives us a rolling window of the last two
-    # servers the account lived on, so a transfer can avoid BOTH of them.
-    row = conn.execute("SELECT worker_id FROM accounts WHERE id = ?",
+    # Maintain an ordered history (oldest -> newest, no duplicates) of every
+    # worker this account has lived on. A "worker transfer" reads it to prefer a
+    # server the account has NEVER used, and to fall back to the LEAST-recently
+    # used one when they've all been used — so it works for ANY number of
+    # workers and never gets stuck.
+    row = conn.execute("SELECT worker_history FROM accounts WHERE id = ?",
                        (int(account_id),)).fetchone()
-    cur = row["worker_id"] if row else None
-    if cur is not None and worker_id is not None and int(cur) != int(worker_id):
-        conn.execute(
-            "UPDATE accounts SET prev_worker_id = ?, worker_id = ? WHERE id = ?",
-            (cur, worker_id, int(account_id)))
-    else:
-        conn.execute("UPDATE accounts SET worker_id = ? WHERE id = ?",
-                     (worker_id, int(account_id)))
+    try:
+        hist = json.loads(row["worker_history"]) if row and row["worker_history"] else []
+    except Exception:
+        hist = []
+    if worker_id is not None:
+        wid = int(worker_id)
+        # move (or add) this worker to the most-recent end, dropping any older
+        # occurrence so it acts as an LRU order without duplicates.
+        hist = [int(h) for h in hist if int(h) != wid]
+        hist.append(wid)
+        if len(hist) > 100:            # workers are few; cap only to stay bounded
+            hist = hist[-100:]
+    conn.execute("UPDATE accounts SET worker_id = ?, worker_history = ? WHERE id = ?",
+                 (worker_id, json.dumps(hist), int(account_id)))
     conn.commit()
     conn.close()
+
+
+def get_account_worker_history(account_id: int) -> list:
+    """Ordered list (oldest -> newest) of worker ids this account has lived on.
+    Used by the worker-transfer flow to avoid recently-used servers."""
+    conn = _conn()
+    row = conn.execute("SELECT worker_history FROM accounts WHERE id = ?",
+                       (int(account_id),)).fetchone()
+    conn.close()
+    if not row or not row["worker_history"]:
+        return []
+    try:
+        return [int(x) for x in json.loads(row["worker_history"])]
+    except Exception:
+        return []
 
 
 # --------------------------------------------------------------------------- #
