@@ -363,6 +363,11 @@ def init():
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
         c.execute("ALTER TABLE accounts ADD COLUMN worker_id INTEGER")
+    # ---- migration: remember the PREVIOUS worker an account lived on, so a
+    # "worker transfer" can avoid the last TWO servers (current + previous),
+    # not just the current one. ----
+    if "prev_worker_id" not in cols:
+        c.execute("ALTER TABLE accounts ADD COLUMN prev_worker_id INTEGER")
     # ---- migration (v4): portable Rubika session blob (encrypted at rest) ----
     if "session_blob" not in cols:
         c.execute("ALTER TABLE accounts ADD COLUMN session_blob TEXT")
@@ -680,8 +685,19 @@ def count_accounts_on_worker(worker_id: int) -> int:
 
 def set_account_worker(account_id: int, worker_id):
     conn = _conn()
-    conn.execute("UPDATE accounts SET worker_id = ? WHERE id = ?",
-                 (worker_id, int(account_id)))
+    # When the owning worker actually CHANGES (e.g. a transfer), keep the old
+    # worker as prev_worker_id. This gives us a rolling window of the last two
+    # servers the account lived on, so a transfer can avoid BOTH of them.
+    row = conn.execute("SELECT worker_id FROM accounts WHERE id = ?",
+                       (int(account_id),)).fetchone()
+    cur = row["worker_id"] if row else None
+    if cur is not None and worker_id is not None and int(cur) != int(worker_id):
+        conn.execute(
+            "UPDATE accounts SET prev_worker_id = ?, worker_id = ? WHERE id = ?",
+            (cur, worker_id, int(account_id)))
+    else:
+        conn.execute("UPDATE accounts SET worker_id = ? WHERE id = ?",
+                     (worker_id, int(account_id)))
     conn.commit()
     conn.close()
 

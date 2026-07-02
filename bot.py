@@ -5594,16 +5594,22 @@ async def resume_relogin_cb(event):
     # always lands on a DIFFERENT server (or cleanly says there isn't one).
     cur_w = worker.worker_for_account(acc) if acc else None
     cur_wid = cur_w["id"] if cur_w else None
-    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرور فعلی) برای انتقال ...")
-    # WORKER TRANSFER: pick a worker that is NOT the account's current server.
+    # The PREVIOUS worker this account lived on (recorded by set_account_worker
+    # on the last transfer). We exclude it too, so a transfer lands on a server
+    # DIFFERENT from the last TWO the account has been on.
+    prev_wid = acc.get("prev_worker_id") if acc else None
+    exclude_ids = [wid for wid in (cur_wid, prev_wid) if wid is not None]
+    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از دو سرور قبلی که اکانت روش بوده) برای انتقال ...")
+    # WORKER TRANSFER: pick a worker that is NOT the account's current server
+    # AND not its previous server (the last two it lived on).
     try:
-        neww = await worker.pick_worker_for_login(exclude_id=cur_wid)
+        neww = await worker.pick_worker_for_login(exclude_ids=exclude_ids)
     except Exception:
         neww = None
     if not neww:
         await safe_edit(event,
-            "❌ ورکرِ دیگه‌ای برای انتقال نداری (فقط همین سرور رو داری).\n"
-            "برای «انتقال ورکر» اول یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
+            "❌ ورکرِ مناسبی برای انتقال پیدا نشد (غیر از دو سرورِ آخری که اکانت روش بوده).\n"
+            "برای «انتقال ورکر» یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
             "یا فعلاً با همین سرور ادامه بده:",
             buttons=[[Button.inline("✅ ادامه با همین سرور", f"rcont_{aid}".encode())],
                      [Button.inline("🛠 افزودن ورکر", b"wk_add")],
