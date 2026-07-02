@@ -5594,16 +5594,41 @@ async def resume_relogin_cb(event):
     # always lands on a DIFFERENT server (or cleanly says there isn't one).
     cur_w = worker.worker_for_account(acc) if acc else None
     cur_wid = cur_w["id"] if cur_w else None
-    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرور فعلی) برای انتقال ...")
-    # WORKER TRANSFER: pick a worker that is NOT the account's current server.
+    # Full history (oldest -> newest) of every worker this account has lived on.
     try:
-        neww = await worker.pick_worker_for_login(exclude_id=cur_wid)
+        history = db.get_account_worker_history(aid)
     except Exception:
-        neww = None
+        history = []
+    # Treat the CURRENT server as the most-recent visited, even if it wasn't
+    # recorded (e.g. account on the master with worker_id NULL).
+    if cur_wid is not None:
+        history = [h for h in history if h != cur_wid] + [cur_wid]
+    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرورهای اخیری که اکانت روش بوده) برای انتقال ...")
+    # WORKER TRANSFER: prefer a server the account has NEVER used. If every
+    # server has been used, progressively release the OLDEST-used ones back
+    # (least-recently-used first) while still avoiding the most-recent — and
+    # always the current — as long as possible. Works for ANY number of workers
+    # and never gets stuck.
+    neww = None
+    avoid = list(history)                     # oldest -> newest (current last)
+    while avoid:
+        try:
+            neww = await worker.pick_worker_for_login(exclude_ids=avoid)
+        except Exception:
+            neww = None
+        if neww:
+            break
+        avoid = avoid[1:]                      # release the least-recently-used one
+    # last-resort safety net: at minimum move OFF the current server.
+    if not neww and cur_wid is not None:
+        try:
+            neww = await worker.pick_worker_for_login(exclude_id=cur_wid)
+        except Exception:
+            neww = None
     if not neww:
         await safe_edit(event,
-            "❌ ورکرِ دیگه‌ای برای انتقال نداری (فقط همین سرور رو داری).\n"
-            "برای «انتقال ورکر» اول یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
+            "❌ ورکرِ دیگه‌ای برای انتقال پیدا نشد (غیر از سروری که اکانت الان روشه).\n"
+            "برای «انتقال ورکر» یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
             "یا فعلاً با همین سرور ادامه بده:",
             buttons=[[Button.inline("✅ ادامه با همین سرور", f"rcont_{aid}".encode())],
                      [Button.inline("🛠 افزودن ورکر", b"wk_add")],

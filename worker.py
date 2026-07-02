@@ -448,11 +448,13 @@ def is_healthy(worker: dict) -> bool:
 # --------------------------------------------------------------------------- #
 # Selection: round-robin with failover for a NEW account login.
 # --------------------------------------------------------------------------- #
-async def pick_worker_for_login(verify: bool = True, exclude_id=None) -> dict:
+async def pick_worker_for_login(verify: bool = True, exclude_id=None,
+                                exclude_ids=None) -> dict:
     """Choose the healthy enabled worker with the fewest accounts (= round-robin
     as accounts are added one at a time). Verifies health right before use.
-    If exclude_id is given, that worker is NOT considered (used for "worker
-    transfer": re-login the account on a DIFFERENT server than the current one).
+    If exclude_id / exclude_ids are given, those workers are NOT considered
+    (used for "worker transfer": re-login the account on a server it hasn't
+    used recently; the caller decides how many recent servers to exclude).
     Returns a worker dict or None if none are usable.
     """
     # Make sure a master row exists (creates it once if missing), but routing
@@ -474,8 +476,14 @@ async def pick_worker_for_login(verify: bool = True, exclude_id=None) -> dict:
 
     # local master is always usable; remotes must be healthy ("ok").
     pool = [w for w in workers if (is_local(w) or w.get("status") == "ok")]
+    excluded = set()
     if exclude_id is not None:
-        pool = [w for w in pool if w["id"] != exclude_id]
+        excluded.add(int(exclude_id))
+    for x in (exclude_ids or []):
+        if x is not None:
+            excluded.add(int(x))
+    if excluded:
+        pool = [w for w in pool if int(w["id"]) not in excluded]
     if not pool:
         return None
     pool.sort(key=lambda w: (load(w), w["id"]))
