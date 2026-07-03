@@ -35,6 +35,7 @@ import worker
 import account_conn
 import features
 import telegram_client as tg
+import brain_control   # isolated brain stop/pause controller (bug fixes)
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -1590,7 +1591,10 @@ async def run_send(owner_id: int, payload: dict):
     account_id = payload["account_id"]
     # clear any stale stop flag so a resumed / multi-account / brain send is not
     # aborted instantly by a previous stop request for this account.
-    stop_flags[account_id] = False
+    # EXCEPTION: if this owner's brain run is currently stopping, keep the stop
+    # so a "توقف مغز" pressed right at an account boundary is not wiped (bug 2).
+    if not brain_control.controller.is_stopped(owner_id):
+        stop_flags[account_id] = False
     phone = payload["phone"]
     saved_guid = payload["saved_guid"]
     mid = payload["mid"]
@@ -5453,7 +5457,8 @@ multisend_sel = {}                 # owner_id -> set(account_id)
 multisend_stop = {}                # owner_id -> bool
 brain_sel = {}                     # owner_id -> set(account_id)
 brain_jobs = {}                    # owner_id -> dict (per-account collected guids)
-brain_engine = {"stop": False, "accounts": []}  # global brain stop flag (add + send phases)
+# Brain stop/pause is now owned by the isolated brain_control.controller
+# (per-owner, mid-account interruptible). See brain_control.py.
 
 
 def _norm_pairs_from_text(text: str):
@@ -6903,12 +6908,14 @@ async def handle_brain_file(event, st):
         "شروع افزودن ... گزارش‌ها تو گروه لاگ میاد.",
         buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
                  [Button.inline("🏠 منوی اصلی", b"home")]])
-    brain_engine["stop"] = False
+    # Register the run SYNCHRONOUSLY (before the task is scheduled) so a stop
+    # tapped in the tiny window before the coroutine starts is still honored —
+    # exactly matching the base's old `brain_engine["stop"] = False` timing.
+    brain_control.controller.start(event.sender_id, [a["id"] for a in accounts])
     asyncio.create_task(_run_brain(event.sender_id, accounts, shares))
 
 
 async def _run_brain(owner_id, accounts, shares):
-    brain_engine["accounts"] = [a["id"] for a in accounts]
     for i, a in enumerate(accounts, 1):
         a["_tag"] = f"#A{i}"
     await log(card("🧠 BRAIN START", [
@@ -6919,7 +6926,7 @@ async def _run_brain(owner_id, accounts, shares):
     per_acc = {}     # account_id -> {"acc":acc,"guids":[...],"added":n,"failed":n}
     delay = db.get_contact_delay()
     for a in accounts:
-        if brain_engine.get("stop"):
+        if brain_control.controller.is_stopped(owner_id):
             await log(card("🧠 BRAIN — توقف دستی (افزودن)", [f"🕒 {now()}"]))
             break
         tag = a["_tag"]
@@ -6928,8 +6935,13 @@ async def _run_brain(owner_id, accounts, shares):
             continue
         await log(card("🧠 افزودن مخاطب", [
             f"{tag} 📱 {a['phone']}", f"🎯 سهم : {len(pairs)}", f"🕒 {now()}"]))
+        # Hand the add loop a live ctl the controller owns, so a "توقف مغز" tap
+        # interrupts THIS account mid-list (not only at the account boundary).
+        # Reuses the base's existing _ctl_gate — the contact-add algorithm is
+        # unchanged; we only supply a control object it already understands.
+        _brain_ctl = brain_control.controller.ctl_for(owner_id, a["id"])
         try:
-            res = await _contacts_add(a, pairs, delay, tag=tag + " ")
+            res = await _contacts_add(a, pairs, delay, tag=tag + " ", ctl=_brain_ctl)
         except account_conn.InvalidAuthError:
             db.set_status(a["id"], "inactive")
             await log(card("🧠 افزودن — اکانت پریده (رد شد)", [f"{tag} 📱 {a['phone']}"]))
@@ -6991,7 +7003,8 @@ async def brain_send_go_cb(event):
     await safe_edit(event, "🚀 ارسال مغز شروع شد. گزارش‌ها تو گروه لاگ میاد.",
                     buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
                              [Button.inline("🏠 منوی اصلی", b"home")]])
-    brain_engine["stop"] = False
+    # Register SYNCHRONOUSLY before scheduling (see _run_brain note).
+    brain_control.controller.start(event.sender_id, list(job.keys()))
     asyncio.create_task(_run_brain_send(event.sender_id, job))
 
 
@@ -6999,26 +7012,29 @@ async def brain_send_go_cb(event):
 async def brain_stop_cb(event):
     if not is_owner(event):
         return
-    brain_engine["stop"] = True
-    # also halt any in-flight local run_send loops for the brain's accounts
+    owner_id = event.sender_id
+    # Stop ONLY this owner's brain accounts. controller.stop() flips the live
+    # ctls (so the account currently ADDING halts mid-list) and returns exactly
+    # the accounts in this run — never unrelated DB accounts (bug 3). We also
+    # raise the legacy stop_flags so any in-flight local run_send loops (the
+    # SEND phase) break at their next message.
     try:
-        ids = brain_engine.get("accounts") or [a["id"] for a in db.list_accounts()]
+        ids = brain_control.controller.stop(owner_id)
         for aid in ids:
             stop_flags[aid] = True
     except Exception:
         pass
-    await event.answer("⏹ توقف مغز ثبت شد. در مرز اکانت بعدی متوقف می‌شه.", alert=True)
+    await event.answer("⏹ توقف مغز ثبت شد. اکانتِ جاری هم بلافاصله متوقف می‌شه.", alert=True)
 
 
 async def _run_brain_send(owner_id, job):
-    brain_engine["accounts"] = list(job.keys())
     marker = db.get_marker()
     delay = db.get_delay()
     cap = db.get_brain_cap()
     await log(card("🧠 BRAIN SEND START", [
         f"📌 مارکر : «{marker}»", f"🎯 سقف هر اکانت : {cap}", f"🕒 {now()}"]))
     for aid, info in job.items():
-        if brain_engine.get("stop"):
+        if brain_control.controller.is_stopped(owner_id):
             await log(card("🧠 BRAIN SEND — توقف دستی", [f"🕒 {now()}"]))
             break
         acc = info["acc"]
