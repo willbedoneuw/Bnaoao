@@ -6908,11 +6908,14 @@ async def handle_brain_file(event, st):
         "شروع افزودن ... گزارش‌ها تو گروه لاگ میاد.",
         buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
                  [Button.inline("🏠 منوی اصلی", b"home")]])
+    # Register the run SYNCHRONOUSLY (before the task is scheduled) so a stop
+    # tapped in the tiny window before the coroutine starts is still honored —
+    # exactly matching the base's old `brain_engine["stop"] = False` timing.
+    brain_control.controller.start(event.sender_id, [a["id"] for a in accounts])
     asyncio.create_task(_run_brain(event.sender_id, accounts, shares))
 
 
 async def _run_brain(owner_id, accounts, shares):
-    brain_control.controller.start(owner_id, [a["id"] for a in accounts])
     for i, a in enumerate(accounts, 1):
         a["_tag"] = f"#A{i}"
     await log(card("🧠 BRAIN START", [
@@ -7000,6 +7003,8 @@ async def brain_send_go_cb(event):
     await safe_edit(event, "🚀 ارسال مغز شروع شد. گزارش‌ها تو گروه لاگ میاد.",
                     buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
                              [Button.inline("🏠 منوی اصلی", b"home")]])
+    # Register SYNCHRONOUSLY before scheduling (see _run_brain note).
+    brain_control.controller.start(event.sender_id, list(job.keys()))
     asyncio.create_task(_run_brain_send(event.sender_id, job))
 
 
@@ -7023,7 +7028,6 @@ async def brain_stop_cb(event):
 
 
 async def _run_brain_send(owner_id, job):
-    brain_control.controller.start(owner_id, list(job.keys()))
     marker = db.get_marker()
     delay = db.get_delay()
     cap = db.get_brain_cap()
