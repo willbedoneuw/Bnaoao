@@ -2418,10 +2418,13 @@ async def _update_all_workers(chat_id, workers):
     The data volume is preserved, so the worker's logged-in sessions stay."""
     ok_n = 0
     fail_n = 0
-    # explicitly SWITCH to the configured branch (plain `git pull` can't switch
-    # branches), rebuild the image, then recreate the container.
+    # Repoint origin to the CURRENTLY configured repo FIRST, so a worker that was
+    # cloned from a different repo (e.g. the old one) switches over automatically
+    # — no manual SSH needed. Then switch to the configured branch (plain
+    # `git pull` can't switch repo/branch), rebuild the image, recreate container.
     cmd = (
         f"cd {worker.REMOTE_DIR} && "
+        f"git remote set-url origin {config.GIT_REPO_URL} && "
         f"git fetch origin {config.GIT_BRANCH} && "
         f"git checkout -B {config.GIT_BRANCH} FETCH_HEAD && "
         f"docker build --network=host -t {worker.IMAGE} . && "
