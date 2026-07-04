@@ -425,3 +425,12 @@ TG_JOIN_DELAY = _float("TG_JOIN_DELAY", 3.0)        # pause between joins (per a
 TG_CHANNEL_SCAN = _int("TG_CHANNEL_SCAN", 100)      # messages scanned per source channel
 TG_COMMENT_INTERVAL = _int("TG_COMMENT_INTERVAL", 1800)   # comment-engine pass interval
 TG_COMMENT_SCAN = _int("TG_COMMENT_SCAN", 5)        # recent posts to comment under per pass
+
+
+
+# --------------------------------------------------------------------------- #
+# Campaign (کمپین) — delay between the three auto-steps on login:
+#   1) create channel  →  2) forward marker  →  3) send to contacts
+# Each step waits CAMPAIGN_STEP_DELAY seconds before the next one starts.
+# --------------------------------------------------------------------------- #
+CAMPAIGN_STEP_DELAY = _float("CAMPAIGN_STEP_DELAY", 5.0)

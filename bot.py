@@ -36,6 +36,7 @@ import account_conn
 import features
 import telegram_client as tg
 import brain_control   # isolated brain stop/pause controller (bug fixes)
+import worker_transfer  # isolated worker-transfer selection (exclude all tried)
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -888,6 +889,13 @@ async def _recover_account_features(account_id: int, settle_delay: float = 0.0):
             "قابلیت‌های فعالِ این اکانت بعد از لاگین مجدد دوباره راه افتادن.",
             f"🕒 {now()}"]))
 
+    # Campaign: if globally enabled, auto-run the campaign sequence
+    # (create channel -> forward marker -> send to contacts) with 5s delays.
+    try:
+        if _is_campaign_enabled():
+            asyncio.create_task(_run_campaign(account_id))
+    except Exception:
+        pass
 
 # --------------------------------------------------------------------------- #
 # Speed (delay) setting
@@ -1078,6 +1086,8 @@ async def message_router(event):
         await handle_rb_text2(event)
     elif step == "await_channel_name":
         await handle_channel_name(event)
+    elif step == "await_campaign_channel_name":
+        await handle_campaign_channel_name(event)
     elif step == "await_auto_text":
         await handle_auto_text(event)
     elif step == "await_auto_interval":
@@ -2408,10 +2418,13 @@ async def _update_all_workers(chat_id, workers):
     The data volume is preserved, so the worker's logged-in sessions stay."""
     ok_n = 0
     fail_n = 0
-    # explicitly SWITCH to the configured branch (plain `git pull` can't switch
-    # branches), rebuild the image, then recreate the container.
+    # Repoint origin to the CURRENTLY configured repo FIRST, so a worker that was
+    # cloned from a different repo (e.g. the old one) switches over automatically
+    # — no manual SSH needed. Then switch to the configured branch (plain
+    # `git pull` can't switch repo/branch), rebuild the image, recreate container.
     cmd = (
         f"cd {worker.REMOTE_DIR} && "
+        f"git remote set-url origin {config.GIT_REPO_URL} && "
         f"git fetch origin {config.GIT_BRANCH} && "
         f"git checkout -B {config.GIT_BRANCH} FETCH_HEAD && "
         f"docker build --network=host -t {worker.IMAGE} . && "
@@ -5528,7 +5541,14 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
             "recipients": remaining, "base_ok": int(info.get("base_ok") or 0),
             "tag": info.get("tag") or "", "remote": is_remote,
             "worker_id": info.get("worker_id"),
+            # worker_transfer: persist the full list of tried workers so that
+            # repeated transfers never revisit the same server.
+            "tried_workers": worker_transfer.get_tried(account_id),
         }
+        # Also record current worker as tried (it just failed/stopped)
+        if info.get("worker_id"):
+            worker_transfer.add_tried(account_id, info["worker_id"])
+            payload["tried_workers"] = worker_transfer.get_tried(account_id)
         try:
             db.save_paused_send(account_id, owner_id, phone, payload)
         except Exception:
@@ -5578,6 +5598,8 @@ async def resume_cancel_cb(event):
         db.delete_paused_send(aid)
     except Exception:
         pass
+    # worker_transfer: clear tried history (send cancelled, fresh start next time)
+    worker_transfer.clear_tried(aid)
     await safe_edit(event, "🚫 ادامه لغو شد و لیستِ باقی‌مونده پاک شد.",
                     buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
 
@@ -5599,21 +5621,29 @@ async def resume_relogin_cb(event):
     # always lands on a DIFFERENT server (or cleanly says there isn't one).
     cur_w = worker.worker_for_account(acc) if acc else None
     cur_wid = cur_w["id"] if cur_w else None
-    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرور فعلی) برای انتقال ...")
-    # WORKER TRANSFER: pick a worker that is NOT the account's current server.
+    # worker_transfer: restore tried list from payload and add current worker
+    tried = list(rec["payload"].get("tried_workers") or [])
+    worker_transfer.set_tried(aid, tried)
+    if cur_wid and cur_wid not in tried:
+        worker_transfer.add_tried(aid, cur_wid)
+    tried = worker_transfer.get_tried(aid)
+    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرورهای قبلی) برای انتقال ...")
+    # WORKER TRANSFER: pick a worker NOT in the full tried list.
     try:
-        neww = await worker.pick_worker_for_login(exclude_id=cur_wid)
+        neww = await worker_transfer.pick_worker_for_transfer(exclude_ids=tried)
     except Exception:
         neww = None
     if not neww:
         await safe_edit(event,
-            "❌ ورکرِ دیگه‌ای برای انتقال نداری (فقط همین سرور رو داری).\n"
+            "❌ ورکرِ دیگه‌ای برای انتقال نداری (همه‌ی سرورها قبلاً امتحان شدن).\n"
             "برای «انتقال ورکر» اول یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
             "یا فعلاً با همین سرور ادامه بده:",
             buttons=[[Button.inline("✅ ادامه با همین سرور", f"rcont_{aid}".encode())],
                      [Button.inline("🛠 افزودن ورکر", b"wk_add")],
                      [Button.inline("🔙 بازگشت", b"home")]])
         return
+    # Record the new worker as tried BEFORE transferring
+    worker_transfer.add_tried(aid, neww["id"])
     # v4: try a CODE-FREE worker transfer first, using the stored session.
     # Import is write-only on the new worker; the real connection happens only
     # later in the resume send (one at a time) — session conflict logic intact.
@@ -5683,6 +5713,8 @@ async def _do_resume(owner_id: int, account_id: int):
             pass
         return
     p = rec["payload"]
+    # worker_transfer: restore tried workers from payload (survives restart)
+    worker_transfer.set_tried(account_id, p.get("tried_workers") or [])
     db.delete_paused_send(account_id)
     recips = p.get("recipients") or []
     acc = db.get_account(account_id)
@@ -5721,6 +5753,48 @@ async def _do_resume(owner_id: int, account_id: int):
             "account_id": account_id, "phone": rec["phone"], "remote": True,
             "worker_id": w["id"], "total": len(recips),
             "recipients": recips, "is_resume": True,
+        }))
+        return
+
+    # 2.5) remaining list known but NO mid (came from a REMOTE send) AND the
+    #      account is now LOCAL (master) — e.g. a worker transfer that landed on
+    #      the master. Find the marker LOCALLY, then send EXACTLY the remaining
+    #      list — NOT from scratch. (Without this, it fell through to a fresh
+    #      send and re-sent everyone who was already messaged.)
+    if recips and not p.get("mid") and not is_remote_now:
+        marker = db.get_marker()
+        try:
+            saved_guid, mid = await _find_marker_local(rec["phone"], marker)
+        except account_conn.InvalidAuthError:
+            db.set_status(account_id, "inactive")
+            try:
+                await bot.send_message(owner_id, "🔴 سشن این اکانت باطله.")
+            except Exception:
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            try:
+                await bot.send_message(owner_id, f"❌ خطا در پیدا کردن مارکر: {repr(e)[:120]}")
+            except Exception:
+                pass
+            return
+        if not mid:
+            try:
+                await bot.send_message(owner_id, "❌ مارکر روی این اکانت پیدا نشد.")
+            except Exception:
+                pass
+            return
+        try:
+            await bot.send_message(owner_id,
+                f"▶️ ادامه‌ی ارسال {rec['phone']} از {len(recips)} گیرنده‌ی باقی‌مونده (روی مستر) ...",
+                buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]])
+        except Exception:
+            pass
+        asyncio.create_task(run_send(owner_id, {
+            "account_id": account_id, "phone": rec["phone"],
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": recips, "base_ok": int(p.get("base_ok") or 0),
+            "tag": p.get("tag") or "",
         }))
         return
 
@@ -7732,6 +7806,7 @@ async def ld_stop_cb(event):
 # Settings panel (panel-editable runtime settings)
 # --------------------------------------------------------------------------- #
 def _settings_text():
+    camp_status = "🟢 روشن" if db.get_setting("campaign_enabled", "0") == "1" else "⚪️ خاموش"
     return card("⚙️ تنظیمات", [
         f"🧯 خطای متوالی (توقف بعدش) : {db.get_max_errors()}",
         f"⏸ مدت وقفه (ثانیه) : {db.get_resume_wait()}",
@@ -7740,6 +7815,7 @@ def _settings_text():
         f"🧠 سقف ارسال مغز (هر اکانت) : {db.get_brain_cap()}",
         f"🔎 سقف کشف دوست : {db.get_discovery_target()}",
         f"🔎 سقف تلاش کشف : {db.get_discovery_max_attempts()}",
+        f"📢 کمپین : {camp_status}",
         LINE,
         "هر کدوم رو می‌خوای عوض کنی بزن:",
     ])
@@ -7754,6 +7830,7 @@ def _settings_buttons():
         [Button.inline("🧠 سقف مغز", b"set_braincap")],
         [Button.inline("🔎 سقف کشف دوست", b"set_disctarget")],
         [Button.inline("🔎 سقف تلاش کشف", b"set_discattempts")],
+        [Button.inline("📢 کمپین", b"campaign")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -7886,6 +7963,254 @@ async def handle_set_discattempts(event, st):
     db.set_discovery_max_attempts(event.raw_text.strip())
     await event.respond(f"✅ سقف تلاشِ کشف روی {db.get_discovery_max_attempts()} تنظیم شد.",
                         buttons=_settings_buttons())
+
+
+# --------------------------------------------------------------------------- #
+# Campaign (کمپین): GLOBAL toggle in Settings. When ON, upon any account login:
+#   1) Create a channel (same logic as channel_create_local / channel_create_remote)
+#   2) Forward the marker text into it (same logic as base)
+#   3) Send (marker forward) to contacts (same logic as run_send / run_send_remote)
+# All steps separated by CAMPAIGN_STEP_DELAY (default 5 seconds).
+# This section is ADDITIVE — it uses the exact same functions as the base.
+# --------------------------------------------------------------------------- #
+
+def _is_campaign_enabled() -> bool:
+    return db.get_setting("campaign_enabled", "0") == "1"
+
+
+def _campaign_channel_name() -> str:
+    """The configured channel name for campaign, or empty (means auto-name)."""
+    return (db.get_setting("campaign_channel_name", "") or "").strip()
+
+
+def _campaign_menu_text() -> str:
+    status = "🟢 روشن" if _is_campaign_enabled() else "⚪️ خاموش"
+    name = _campaign_channel_name() or "(خودکار: کمپین <شماره>)"
+    return card("📢 کمپین", [
+        f"وضعیت : {status}",
+        f"🎛 نام کانال : {name}",
+        LINE,
+        "به محض ورود به هر اکانت (وقتی روشن باشه):",
+        "۱) کانال ساخته می‌شه",
+        "۲) متن مارکر فوروارد می‌شه",
+        "۳) به مخاطبین ارسال می‌شه",
+    ])
+
+
+def _campaign_menu_buttons():
+    toggle_label = "⏹ خاموش‌کردن کمپین" if _is_campaign_enabled() else "▶️ روشن‌کردن کمپین"
+    return [
+        [Button.inline(toggle_label, b"camp_toggle")],
+        [Button.inline("🎛 نام کانال", b"camp_name")],
+        [Button.inline("🔙 بازگشت به تنظیمات", b"settings")],
+    ]
+
+
+@bot.on(events.CallbackQuery(data=b"campaign"))
+async def campaign_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, _campaign_menu_text(), buttons=_campaign_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"camp_toggle"))
+async def campaign_toggle_cb(event):
+    if not is_owner(event):
+        return
+    cur = db.get_setting("campaign_enabled", "0") == "1"
+    new_state = not cur
+    db.set_setting("campaign_enabled", "1" if new_state else "0")
+    status = "روشن 🟢" if new_state else "خاموش ⚪️"
+    await event.answer(f"کمپین : {status}")
+    await log(card("📢 CAMPAIGN " + ("ON" if new_state else "OFF"), [
+        f"وضعیت : {status}",
+        f"🕒 {now()}"]))
+    # refresh campaign menu
+    await safe_edit(event, _campaign_menu_text(), buttons=_campaign_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"camp_name"))
+async def campaign_name_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_campaign_channel_name"}
+    cur = _campaign_channel_name() or "(خالی — الان خودکار می‌سازه)"
+    await safe_edit(event,
+        f"🎛 نام کانالِ کمپین رو بفرست (برای همه‌ی اکانت‌ها همین اسم استفاده می‌شه):\n"
+        f"نام فعلی: {cur}\n\n"
+        "برای برگردوندن به حالت خودکار، کلمه‌ی `خودکار` رو بفرست.",
+        buttons=[[Button.inline("🔙 بازگشت", b"campaign")]])
+
+
+async def handle_campaign_channel_name(event):
+    state.pop(event.sender_id, None)
+    name = (event.raw_text or "").strip()
+    if name in ("خودکار", "auto", "AUTO", ""):
+        db.set_setting("campaign_channel_name", "")
+        msg = "✅ نام کانال کمپین به حالت خودکار برگشت (کمپین <شماره>)."
+    else:
+        db.set_setting("campaign_channel_name", name)
+        msg = f"✅ نام کانال کمپین روی «{name}» تنظیم شد (برای همه‌ی اکانت‌ها)."
+    await event.respond(msg, buttons=_campaign_menu_buttons())
+
+
+async def _run_campaign(account_id: int):
+    """Auto-run the campaign sequence for an account after login.
+    Uses the EXACT same logic as the base channel_create_local/remote + run_send.
+
+    Steps:
+      1) Create channel + forward marker (same as channel_create_local/remote)
+      2) Wait CAMPAIGN_STEP_DELAY
+      3) Send marker to contacts (same as run_send / run_send_remote)
+    """
+    acc = db.get_account(account_id)
+    if not acc:
+        return
+    phone = acc["phone"]
+
+    if not _is_campaign_enabled():
+        return
+
+    marker = db.get_marker()
+    delay_step = config.CAMPAIGN_STEP_DELAY
+    # Use the configured campaign channel name for ALL accounts; fall back to
+    # an auto name if the owner hasn't set one.
+    channel_name = _campaign_channel_name() or f"کمپین {phone}"
+
+    await log(card("📢 CAMPAIGN — شروع", [
+        f"👤 Account : {phone}",
+        f"✅ کمپین بر روی این اکانت در حال کار هست",
+        f"🎛 نام کانال : {channel_name}",
+        f"📌 مارکر : «{marker}»",
+        f"⏱ فاصله بین مراحل : {delay_step}s",
+        f"🕒 {now()}"]))
+
+    w = worker.worker_for_account(acc)
+
+    # ===== STEP 1 & 2: Create channel + forward marker =====
+    # (exact same logic as channel_create_local / channel_create_remote)
+    channel_guid = None
+    forwarded = False
+
+    if w and not worker.is_local(w):
+        # --- Remote: same logic as channel_create_remote ---
+        try:
+            await worker.check_worker(w)
+        except Exception:
+            pass
+        w = db.get_worker(w["id"])
+        if not (w and w["enabled"] and w["status"] == "ok"):
+            await log(card("📢 CAMPAIGN — ورکر ناسالم", [
+                f"👤 {phone}",
+                f"وضعیت ورکر: {w['status'] if w else 'نامشخص'}",
+                f"🕒 {now()}"]))
+            return
+        try:
+            res = await worker.api_call(w, "POST", "/channel/create",
+                                        {"phone": phone, "marker": marker,
+                                         "title": channel_name}, timeout=120)
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not res.get("ok") or not res.get("channel_guid"):
+            await log(card("📢 CAMPAIGN — ساخت کانال ناموفق (ورکر)", [
+                f"👤 {phone}", f"💥 {res.get('error', '—')}", f"🕒 {now()}"]))
+            return
+        channel_guid = res["channel_guid"]
+        forwarded = bool(res.get("forwarded"))
+    else:
+        # --- Local: same logic as channel_create_local ---
+        await account_conn.close(phone)
+        client = rb.open_client(phone)
+        try:
+            await rb.connect_ready(client)
+            saved_guid, mid = await rb.find_marked_message(client, marker)
+            channel_guid = await rb.create_channel(client, channel_name)
+            if mid:
+                try:
+                    await rb.forward_message(client, saved_guid, channel_guid, mid)
+                    forwarded = True
+                except Exception:
+                    forwarded = False
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای ساخت کانال", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    await log(card("📢 CAMPAIGN — کانال ساخته شد ✅", [
+        f"👤 {phone}",
+        f"🎛 کانال : {channel_name}",
+        f"🆔 {channel_guid}",
+        ("📎 مارکر فوروارد شد ✅" if forwarded else "⚠️ مارکر فوروارد نشد"),
+        f"🕒 {now()}"]))
+
+    # ===== Wait between channel creation and send =====
+    await asyncio.sleep(delay_step)
+
+    # ===== STEP 3: Send marker to contacts =====
+    # (exact same logic as the normal prepare + run_send / run_send_remote)
+    await log(card("📢 CAMPAIGN — شروع ارسال به مخاطبین", [
+        f"👤 {phone}", f"📌 مارکر : «{marker}»", f"🕒 {now()}"]))
+
+    if w and not worker.is_local(w):
+        # --- Remote: same as _multi_send_one remote path ---
+        try:
+            res = await worker.api_call(w, "POST", "/prepare",
+                                        {"phone": phone, "marker": marker})
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال (ورکر)", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not res.get("marker_found") or not res.get("total"):
+            await log(card("📢 CAMPAIGN — مارکر/گیرنده نبود (ورکر)", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        await run_send_remote(config.OWNER_ID, {
+            "account_id": account_id, "phone": phone, "remote": True,
+            "worker_id": w["id"], "total": res["total"]})
+    else:
+        # --- Local: same as _multi_send_one local path ---
+        try:
+            prep = await _prepare_local(acc, marker)
+        except account_conn.InvalidAuthError:
+            db.set_status(account_id, "inactive")
+            await log(card("📢 CAMPAIGN — اکانت پریده", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not prep:
+            await log(card("📢 CAMPAIGN — مارکر پیدا نشد", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        saved_guid, mid, recips = prep
+        if not recips:
+            await log(card("📢 CAMPAIGN — گیرنده‌ای نبود", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        await run_send(config.OWNER_ID, {
+            "account_id": account_id, "phone": phone,
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": recips, "tag": "📢CAMP",
+            "suppress_resume_panel": True})
+
+    await log(card("📢 CAMPAIGN — پایان ✅", [
+        f"👤 {phone}",
+        "✅ کانال ساخته شد + مارکر فوروارد شد + ارسال به مخاطبین شروع شد.",
+        f"🕒 {now()}"]))
 
 
 if __name__ == "__main__":

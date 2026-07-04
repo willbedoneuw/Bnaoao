@@ -2188,3 +2188,13 @@ def tg_list_comment_texts() -> list:
 
 def tg_clear_comment_texts():
     tg_clear_texts("comment")
+
+
+
+# =========================================================================== #
+# Campaign (کمپین) — global toggle. When ON, upon any account login the bot
+# automatically: 1) creates a channel, 2) forwards the marker text into it,
+# 3) sends (marker forward) to contacts — all with a configurable delay.
+# The toggle is stored as "campaign_enabled" = "1"/"0" in app_settings.
+# No per-account DB helpers needed — bot.py uses get_setting/set_setting.
+# =========================================================================== #
