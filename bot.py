@@ -5756,6 +5756,48 @@ async def _do_resume(owner_id: int, account_id: int):
         }))
         return
 
+    # 2.5) remaining list known but NO mid (came from a REMOTE send) AND the
+    #      account is now LOCAL (master) — e.g. a worker transfer that landed on
+    #      the master. Find the marker LOCALLY, then send EXACTLY the remaining
+    #      list — NOT from scratch. (Without this, it fell through to a fresh
+    #      send and re-sent everyone who was already messaged.)
+    if recips and not p.get("mid") and not is_remote_now:
+        marker = db.get_marker()
+        try:
+            saved_guid, mid = await _find_marker_local(rec["phone"], marker)
+        except account_conn.InvalidAuthError:
+            db.set_status(account_id, "inactive")
+            try:
+                await bot.send_message(owner_id, "🔴 سشن این اکانت باطله.")
+            except Exception:
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            try:
+                await bot.send_message(owner_id, f"❌ خطا در پیدا کردن مارکر: {repr(e)[:120]}")
+            except Exception:
+                pass
+            return
+        if not mid:
+            try:
+                await bot.send_message(owner_id, "❌ مارکر روی این اکانت پیدا نشد.")
+            except Exception:
+                pass
+            return
+        try:
+            await bot.send_message(owner_id,
+                f"▶️ ادامه‌ی ارسال {rec['phone']} از {len(recips)} گیرنده‌ی باقی‌مونده (روی مستر) ...",
+                buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]])
+        except Exception:
+            pass
+        asyncio.create_task(run_send(owner_id, {
+            "account_id": account_id, "phone": rec["phone"],
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": recips, "base_ok": int(p.get("base_ok") or 0),
+            "tag": p.get("tag") or "",
+        }))
+        return
+
     # 3) remote (no precise list) -> fresh send routed by the current worker
     try:
         await bot.send_message(owner_id, "▶️ ادامه‌ی ارسال ...",
