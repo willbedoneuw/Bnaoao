@@ -7976,6 +7976,7 @@ async def _run_campaign(account_id: int):
 
     await log(card("📢 CAMPAIGN — شروع", [
         f"👤 Account : {phone}",
+        f"✅ کمپین بر روی این اکانت در حال کار هست",
         f"🎛 نام کانال : {channel_name}",
         f"📌 مارکر : «{marker}»",
         f"⏱ فاصله بین مراحل : {delay_step}s",
