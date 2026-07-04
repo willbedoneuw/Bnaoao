@@ -7900,11 +7900,11 @@ async def handle_set_discattempts(event, st):
 
 # --------------------------------------------------------------------------- #
 # Campaign (کمپین): GLOBAL toggle in Settings. When ON, upon any account login:
-#   1) Create a channel
-#   2) Forward the marker text into it
-#   3) Send (marker forward) to contacts
+#   1) Create a channel (same logic as channel_create_local / channel_create_remote)
+#   2) Forward the marker text into it (same logic as base)
+#   3) Send (marker forward) to contacts (same logic as run_send / run_send_remote)
 # All steps separated by CAMPAIGN_STEP_DELAY (default 5 seconds).
-# This section is ADDITIVE — it never modifies the base logic above.
+# This section is ADDITIVE — it uses the exact same functions as the base.
 # --------------------------------------------------------------------------- #
 
 def _campaign_status_text() -> str:
@@ -7934,11 +7934,13 @@ def _is_campaign_enabled() -> bool:
 
 
 async def _run_campaign(account_id: int):
-    """Auto-run the campaign sequence for an account after login:
-    1) Create a channel (name = "کمپین <phone>")
-    2) Forward the marker text into the channel
-    3) Send (marker forward) to all contacts
-    Each step is separated by CAMPAIGN_STEP_DELAY seconds.
+    """Auto-run the campaign sequence for an account after login.
+    Uses the EXACT same logic as the base channel_create_local/remote + run_send.
+
+    Steps:
+      1) Create channel + forward marker (same as channel_create_local/remote)
+      2) Wait CAMPAIGN_STEP_DELAY
+      3) Send marker to contacts (same as run_send / run_send_remote)
     """
     acc = db.get_account(account_id)
     if not acc:
@@ -7961,56 +7963,65 @@ async def _run_campaign(account_id: int):
 
     w = worker.worker_for_account(acc)
 
-    # ===== STEP 1: Create channel =====
+    # ===== STEP 1 & 2: Create channel + forward marker =====
+    # (exact same logic as channel_create_local / channel_create_remote)
     channel_guid = None
     forwarded = False
-    try:
-        if w and not worker.is_local(w):
-            # Remote worker
-            try:
-                res = await worker.api_call(w, "POST", "/channel/create",
-                                            {"phone": phone, "marker": marker,
-                                             "title": channel_name}, timeout=120)
-                if res.get("ok") and res.get("channel_guid"):
-                    channel_guid = res["channel_guid"]
-                    forwarded = bool(res.get("forwarded"))
-                else:
-                    await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
-                        f"👤 {phone}", f"💥 {res.get('error', '—')}", f"🕒 {now()}"]))
-                    return
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-        else:
-            # Local account
-            await account_conn.close(phone)
-            client = rb.open_client(phone)
-            try:
-                await rb.connect_ready(client)
-                channel_guid = await rb.create_channel(client, channel_name)
-                # Step 2 (forward marker) — wait delay then forward
-                await asyncio.sleep(delay_step)
-                saved_guid, mid = await rb.find_marked_message(client, marker)
-                if mid and channel_guid:
-                    try:
-                        await rb.forward_message(client, saved_guid, channel_guid, mid)
-                        forwarded = True
-                    except Exception:
-                        forwarded = False
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای ساخت کانال", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            finally:
+
+    if w and not worker.is_local(w):
+        # --- Remote: same logic as channel_create_remote ---
+        try:
+            await worker.check_worker(w)
+        except Exception:
+            pass
+        w = db.get_worker(w["id"])
+        if not (w and w["enabled"] and w["status"] == "ok"):
+            await log(card("📢 CAMPAIGN — ورکر ناسالم", [
+                f"👤 {phone}",
+                f"وضعیت ورکر: {w['status'] if w else 'نامشخص'}",
+                f"🕒 {now()}"]))
+            return
+        try:
+            res = await worker.api_call(w, "POST", "/channel/create",
+                                        {"phone": phone, "marker": marker,
+                                         "title": channel_name}, timeout=120)
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not res.get("ok") or not res.get("channel_guid"):
+            await log(card("📢 CAMPAIGN — ساخت کانال ناموفق (ورکر)", [
+                f"👤 {phone}", f"💥 {res.get('error', '—')}", f"🕒 {now()}"]))
+            return
+        channel_guid = res["channel_guid"]
+        forwarded = bool(res.get("forwarded"))
+    else:
+        # --- Local: same logic as channel_create_local ---
+        await account_conn.close(phone)
+        client = rb.open_client(phone)
+        try:
+            await rb.connect_ready(client)
+            saved_guid, mid = await rb.find_marked_message(client, marker)
+            channel_guid = await rb.create_channel(client, channel_name)
+            if mid:
                 try:
-                    await client.disconnect()
+                    await rb.forward_message(client, saved_guid, channel_guid, mid)
+                    forwarded = True
                 except Exception:
-                    pass
-    except Exception as e:
-        await log(card("📢 CAMPAIGN — خطای کلی مرحله ۱", [
-            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-        return
+                    forwarded = False
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای ساخت کانال", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     await log(card("📢 CAMPAIGN — کانال ساخته شد ✅", [
         f"👤 {phone}",
@@ -8019,202 +8030,57 @@ async def _run_campaign(account_id: int):
         ("📎 مارکر فوروارد شد ✅" if forwarded else "⚠️ مارکر فوروارد نشد"),
         f"🕒 {now()}"]))
 
-    # ===== Wait between step 2 and step 3 =====
+    # ===== Wait between channel creation and send =====
     await asyncio.sleep(delay_step)
 
     # ===== STEP 3: Send marker to contacts =====
+    # (exact same logic as the normal prepare + run_send / run_send_remote)
     await log(card("📢 CAMPAIGN — شروع ارسال به مخاطبین", [
         f"👤 {phone}", f"📌 مارکر : «{marker}»", f"🕒 {now()}"]))
 
-    try:
-        if w and not worker.is_local(w):
-            try:
-                res = await worker.api_call(w, "POST", "/prepare",
-                                            {"phone": phone, "marker": marker})
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال (ورکر)", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            if not res.get("marker_found") or not res.get("total"):
-                await log(card("📢 CAMPAIGN — مارکر/گیرنده نبود (ورکر)", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            await run_send_remote(config.OWNER_ID, {
-                "account_id": account_id, "phone": phone, "remote": True,
-                "worker_id": w["id"], "total": res["total"]})
-        else:
-            try:
-                prep = await _prepare_local(acc, marker)
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            if not prep:
-                await log(card("📢 CAMPAIGN — مارکر پیدا نشد", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            saved_guid, mid, recips = prep
-            if not recips:
-                await log(card("📢 CAMPAIGN — گیرنده‌ای نبود", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            await run_send(config.OWNER_ID, {
-                "account_id": account_id, "phone": phone,
-                "saved_guid": saved_guid, "mid": mid,
-                "recipients": recips, "tag": "📢CAMP",
-                "suppress_resume_panel": True})
-    except Exception as e:
-        await log(card("📢 CAMPAIGN — خطای ارسال", [
-            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-        return
-
-    await log(card("📢 CAMPAIGN — پایان ✅", [
-        f"👤 {phone}",
-        "✅ کانال ساخته شد + مارکر فوروارد شد + ارسال به مخاطبین شروع شد.",
-        f"🕒 {now()}"]))
-
-
-if __name__ == "__main__":
-    asyncio.run(amain())
-
-
-async def _run_campaign(account_id: int):
-    """Auto-run the campaign sequence for an account after login:
-    1) Create a channel (name = "کمپین <phone>" or user-configured)
-    2) Forward the marker text into the channel
-    3) Send (marker forward) to all contacts
-    Each step is separated by CAMPAIGN_STEP_DELAY seconds.
-    """
-    acc = db.get_account(account_id)
-    if not acc:
-        return
-    phone = acc["phone"]
-    camp = db.get_campaign(account_id)
-    if not camp.get("enabled"):
-        return
-
-    marker = db.get_marker()
-    delay_step = config.CAMPAIGN_STEP_DELAY
-    channel_name = camp.get("channel_name") or f"کمپین {phone}"
-
-    await log(card("📢 CAMPAIGN — شروع", [
-        f"👤 Account : {phone}",
-        f"🎛 نام کانال : {channel_name}",
-        f"📌 مارکر : «{marker}»",
-        f"⏱ فاصله بین مراحل : {delay_step}s",
-        f"🕒 {now()}"]))
-
-    w = worker.worker_for_account(acc)
-
-    # ===== STEP 1: Create channel =====
-    channel_guid = None
-    forwarded = False
-    try:
-        if w and not worker.is_local(w):
-            # Remote worker
-            try:
-                res = await worker.api_call(w, "POST", "/channel/create",
-                                            {"phone": phone, "marker": marker,
-                                             "title": channel_name}, timeout=120)
-                if res.get("ok") and res.get("channel_guid"):
-                    channel_guid = res["channel_guid"]
-                    forwarded = bool(res.get("forwarded"))
-                else:
-                    await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
-                        f"👤 {phone}", f"💥 {res.get('error', '—')}", f"🕒 {now()}"]))
-                    return
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-        else:
-            # Local account
-            await account_conn.close(phone)
-            client = rb.open_client(phone)
-            try:
-                await rb.connect_ready(client)
-                channel_guid = await rb.create_channel(client, channel_name)
-                # Step 2 (forward marker) is done here while connection is open
-                # to avoid reconnecting; but we still wait the delay between them.
-                await asyncio.sleep(delay_step)
-                saved_guid, mid = await rb.find_marked_message(client, marker)
-                if mid and channel_guid:
-                    try:
-                        await rb.forward_message(client, saved_guid, channel_guid, mid)
-                        forwarded = True
-                    except Exception:
-                        forwarded = False
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای ساخت کانال", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-    except Exception as e:
-        await log(card("📢 CAMPAIGN — خطای کلی مرحله ۱", [
-            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-        return
-
-    await log(card("📢 CAMPAIGN — کانال ساخته شد ✅", [
-        f"👤 {phone}",
-        f"🎛 کانال : {channel_name}",
-        f"🆔 {channel_guid}",
-        ("📎 مارکر فوروارد شد ✅" if forwarded else "⚠️ مارکر فوروارد نشد"),
-        f"🕒 {now()}"]))
-
-    # ===== Wait between step 2 and step 3 =====
-    await asyncio.sleep(delay_step)
-
-    # ===== STEP 3: Send marker to contacts =====
-    await log(card("📢 CAMPAIGN — شروع ارسال به مخاطبین", [
-        f"👤 {phone}", f"📌 مارکر : «{marker}»", f"🕒 {now()}"]))
-
-    try:
-        if w and not worker.is_local(w):
-            # Remote: use the standard prepare + send flow
-            try:
-                res = await worker.api_call(w, "POST", "/prepare",
-                                            {"phone": phone, "marker": marker})
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال (ورکر)", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            if not res.get("marker_found") or not res.get("total"):
-                await log(card("📢 CAMPAIGN — مارکر/گیرنده نبود (ورکر)", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            await run_send_remote(config.OWNER_ID, {
-                "account_id": account_id, "phone": phone, "remote": True,
-                "worker_id": w["id"], "total": res["total"]})
-        else:
-            # Local: prepare and send
-            try:
-                prep = await _prepare_local(acc, marker)
-            except Exception as e:
-                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال", [
-                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-                return
-            if not prep:
-                await log(card("📢 CAMPAIGN — مارکر پیدا نشد", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            saved_guid, mid, recips = prep
-            if not recips:
-                await log(card("📢 CAMPAIGN — گیرنده‌ای نبود", [
-                    f"👤 {phone}", f"🕒 {now()}"]))
-                return
-            await run_send(config.OWNER_ID, {
-                "account_id": account_id, "phone": phone,
-                "saved_guid": saved_guid, "mid": mid,
-                "recipients": recips, "tag": "📢CAMP",
-                "suppress_resume_panel": True})
-    except Exception as e:
-        await log(card("📢 CAMPAIGN — خطای ارسال", [
-            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-        return
+    if w and not worker.is_local(w):
+        # --- Remote: same as _multi_send_one remote path ---
+        try:
+            res = await worker.api_call(w, "POST", "/prepare",
+                                        {"phone": phone, "marker": marker})
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال (ورکر)", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not res.get("marker_found") or not res.get("total"):
+            await log(card("📢 CAMPAIGN — مارکر/گیرنده نبود (ورکر)", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        await run_send_remote(config.OWNER_ID, {
+            "account_id": account_id, "phone": phone, "remote": True,
+            "worker_id": w["id"], "total": res["total"]})
+    else:
+        # --- Local: same as _multi_send_one local path ---
+        try:
+            prep = await _prepare_local(acc, marker)
+        except account_conn.InvalidAuthError:
+            db.set_status(account_id, "inactive")
+            await log(card("📢 CAMPAIGN — اکانت پریده", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        except Exception as e:
+            await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال", [
+                f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            return
+        if not prep:
+            await log(card("📢 CAMPAIGN — مارکر پیدا نشد", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        saved_guid, mid, recips = prep
+        if not recips:
+            await log(card("📢 CAMPAIGN — گیرنده‌ای نبود", [
+                f"👤 {phone}", f"🕒 {now()}"]))
+            return
+        await run_send(config.OWNER_ID, {
+            "account_id": account_id, "phone": phone,
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": recips, "tag": "📢CAMP",
+            "suppress_resume_panel": True})
 
     await log(card("📢 CAMPAIGN — پایان ✅", [
         f"👤 {phone}",
