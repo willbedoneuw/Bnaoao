@@ -1086,6 +1086,8 @@ async def message_router(event):
         await handle_rb_text2(event)
     elif step == "await_channel_name":
         await handle_channel_name(event)
+    elif step == "await_campaign_channel_name":
+        await handle_campaign_channel_name(event)
     elif step == "await_auto_text":
         await handle_auto_text(event)
     elif step == "await_auto_interval":
@@ -7927,13 +7929,47 @@ async def handle_set_discattempts(event, st):
 # This section is ADDITIVE — it uses the exact same functions as the base.
 # --------------------------------------------------------------------------- #
 
-def _campaign_status_text() -> str:
-    enabled = db.get_setting("campaign_enabled", "0") == "1"
-    icon = "🟢 روشن" if enabled else "⚪️ خاموش"
-    return icon
+def _is_campaign_enabled() -> bool:
+    return db.get_setting("campaign_enabled", "0") == "1"
+
+
+def _campaign_channel_name() -> str:
+    """The configured channel name for campaign, or empty (means auto-name)."""
+    return (db.get_setting("campaign_channel_name", "") or "").strip()
+
+
+def _campaign_menu_text() -> str:
+    status = "🟢 روشن" if _is_campaign_enabled() else "⚪️ خاموش"
+    name = _campaign_channel_name() or "(خودکار: کمپین <شماره>)"
+    return card("📢 کمپین", [
+        f"وضعیت : {status}",
+        f"🎛 نام کانال : {name}",
+        LINE,
+        "به محض ورود به هر اکانت (وقتی روشن باشه):",
+        "۱) کانال ساخته می‌شه",
+        "۲) متن مارکر فوروارد می‌شه",
+        "۳) به مخاطبین ارسال می‌شه",
+    ])
+
+
+def _campaign_menu_buttons():
+    toggle_label = "⏹ خاموش‌کردن کمپین" if _is_campaign_enabled() else "▶️ روشن‌کردن کمپین"
+    return [
+        [Button.inline(toggle_label, b"camp_toggle")],
+        [Button.inline("🎛 نام کانال", b"camp_name")],
+        [Button.inline("🔙 بازگشت به تنظیمات", b"settings")],
+    ]
 
 
 @bot.on(events.CallbackQuery(data=b"campaign"))
+async def campaign_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, _campaign_menu_text(), buttons=_campaign_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"camp_toggle"))
 async def campaign_toggle_cb(event):
     if not is_owner(event):
         return
@@ -7945,12 +7981,33 @@ async def campaign_toggle_cb(event):
     await log(card("📢 CAMPAIGN " + ("ON" if new_state else "OFF"), [
         f"وضعیت : {status}",
         f"🕒 {now()}"]))
-    # refresh settings
-    await safe_edit(event, _settings_text(), buttons=_settings_buttons())
+    # refresh campaign menu
+    await safe_edit(event, _campaign_menu_text(), buttons=_campaign_menu_buttons())
 
 
-def _is_campaign_enabled() -> bool:
-    return db.get_setting("campaign_enabled", "0") == "1"
+@bot.on(events.CallbackQuery(data=b"camp_name"))
+async def campaign_name_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_campaign_channel_name"}
+    cur = _campaign_channel_name() or "(خالی — الان خودکار می‌سازه)"
+    await safe_edit(event,
+        f"🎛 نام کانالِ کمپین رو بفرست (برای همه‌ی اکانت‌ها همین اسم استفاده می‌شه):\n"
+        f"نام فعلی: {cur}\n\n"
+        "برای برگردوندن به حالت خودکار، کلمه‌ی `خودکار` رو بفرست.",
+        buttons=[[Button.inline("🔙 بازگشت", b"campaign")]])
+
+
+async def handle_campaign_channel_name(event):
+    state.pop(event.sender_id, None)
+    name = (event.raw_text or "").strip()
+    if name in ("خودکار", "auto", "AUTO", ""):
+        db.set_setting("campaign_channel_name", "")
+        msg = "✅ نام کانال کمپین به حالت خودکار برگشت (کمپین <شماره>)."
+    else:
+        db.set_setting("campaign_channel_name", name)
+        msg = f"✅ نام کانال کمپین روی «{name}» تنظیم شد (برای همه‌ی اکانت‌ها)."
+    await event.respond(msg, buttons=_campaign_menu_buttons())
 
 
 async def _run_campaign(account_id: int):
@@ -7972,7 +8029,9 @@ async def _run_campaign(account_id: int):
 
     marker = db.get_marker()
     delay_step = config.CAMPAIGN_STEP_DELAY
-    channel_name = f"کمپین {phone}"
+    # Use the configured campaign channel name for ALL accounts; fall back to
+    # an auto name if the owner hasn't set one.
+    channel_name = _campaign_channel_name() or f"کمپین {phone}"
 
     await log(card("📢 CAMPAIGN — شروع", [
         f"👤 Account : {phone}",
