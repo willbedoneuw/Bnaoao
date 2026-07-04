@@ -2188,3 +2188,45 @@ def tg_list_comment_texts() -> list:
 
 def tg_clear_comment_texts():
     tg_clear_texts("comment")
+
+
+
+# =========================================================================== #
+# Campaign (کمپین) — per-account toggle. When enabled on an account, upon
+# login the bot automatically: 1) creates a channel, 2) forwards the marker
+# text into it, 3) sends (marker forward) to contacts — all with a configurable
+# delay between steps. Stored in app_settings as JSON keyed by account_id.
+# =========================================================================== #
+
+def get_campaign(account_id: int) -> dict:
+    """Return campaign settings for an account.
+    Keys: enabled (bool), channel_name (str, default from account name)."""
+    raw = get_setting(f"campaign_{account_id}", "")
+    if not raw:
+        return {"enabled": False, "channel_name": ""}
+    try:
+        d = _json.loads(raw)
+        return {"enabled": bool(d.get("enabled")),
+                "channel_name": str(d.get("channel_name") or "")}
+    except Exception:
+        return {"enabled": False, "channel_name": ""}
+
+
+def set_campaign(account_id: int, enabled: bool = None, channel_name: str = None):
+    """Update campaign settings for an account (partial update)."""
+    cur = get_campaign(account_id)
+    if enabled is not None:
+        cur["enabled"] = bool(enabled)
+    if channel_name is not None:
+        cur["channel_name"] = str(channel_name)
+    set_setting(f"campaign_{account_id}", _json.dumps(cur, ensure_ascii=False))
+
+
+def list_campaign_enabled_account_ids() -> list:
+    """Return account_ids where campaign is enabled."""
+    out = []
+    for acc in list_accounts():
+        c = get_campaign(acc["id"])
+        if c.get("enabled"):
+            out.append(acc["id"])
+    return out

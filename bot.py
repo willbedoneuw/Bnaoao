@@ -888,6 +888,14 @@ async def _recover_account_features(account_id: int, settle_delay: float = 0.0):
             "قابلیت‌های فعالِ این اکانت بعد از لاگین مجدد دوباره راه افتادن.",
             f"🕒 {now()}"]))
 
+    # Campaign: if enabled for this account, auto-run the campaign sequence
+    # (create channel -> forward marker -> send to contacts) with 5s delays.
+    try:
+        camp = db.get_campaign(account_id)
+        if camp.get("enabled"):
+            asyncio.create_task(_run_campaign(account_id))
+    except Exception:
+        pass
 
 # --------------------------------------------------------------------------- #
 # Speed (delay) setting
@@ -7754,6 +7762,7 @@ def _settings_buttons():
         [Button.inline("🧠 سقف مغز", b"set_braincap")],
         [Button.inline("🔎 سقف کشف دوست", b"set_disctarget")],
         [Button.inline("🔎 سقف تلاش کشف", b"set_discattempts")],
+        [Button.inline("📢 کمپین", b"campaign")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -7886,6 +7895,223 @@ async def handle_set_discattempts(event, st):
     db.set_discovery_max_attempts(event.raw_text.strip())
     await event.respond(f"✅ سقف تلاشِ کشف روی {db.get_discovery_max_attempts()} تنظیم شد.",
                         buttons=_settings_buttons())
+
+
+# --------------------------------------------------------------------------- #
+# Campaign (کمپین): per-account toggle. When enabled, upon login:
+#   1) Create a channel (with a configurable name)
+#   2) Forward the marker text into it
+#   3) Send (marker forward) to contacts
+# All steps separated by CAMPAIGN_STEP_DELAY (default 5 seconds).
+# This section is ADDITIVE — it never modifies the base logic above.
+# --------------------------------------------------------------------------- #
+
+def _campaign_menu_text(accounts: list) -> str:
+    lines = ["📢 کمپین — تنظیمات", LINE,
+             "به محض ورود (لاگین) به هر اکانت که کمپین روشنه:",
+             "۱) کانال ساخته می‌شه",
+             "۲) متن مارکر فوروارد می‌شه",
+             "۳) به مخاطبین ارسال می‌شه",
+             f"⏱ فاصله بین عملیات‌ها : {config.CAMPAIGN_STEP_DELAY} ثانیه",
+             LINE, "وضعیت اکانت‌ها:"]
+    for a in accounts:
+        c = db.get_campaign(a["id"])
+        mark = "🟢 روشن" if c.get("enabled") else "⚪️ خاموش"
+        lines.append(f"  • {a['phone']} : {mark}")
+    return "\n".join(lines)
+
+
+def _campaign_menu_buttons(accounts: list):
+    rows = []
+    for a in accounts:
+        c = db.get_campaign(a["id"])
+        icon = "🟢" if c.get("enabled") else "⚪️"
+        rows.append([Button.inline(
+            f"{icon} {a['phone']} — {'خاموش‌کردن' if c.get('enabled') else 'روشن‌کردن'}",
+            f"camptog_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 بازگشت به تنظیمات", b"settings")])
+    return rows
+
+
+@bot.on(events.CallbackQuery(data=b"campaign"))
+async def campaign_menu_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await safe_edit(event, "اول یک اکانت اضافه کن.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"settings")]])
+        return
+    await safe_edit(event, _campaign_menu_text(accounts),
+                    buttons=_campaign_menu_buttons(accounts))
+
+
+@bot.on(events.CallbackQuery(pattern=b"camptog_(\\d+)"))
+async def campaign_toggle_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    c = db.get_campaign(account_id)
+    new_state = not c.get("enabled")
+    db.set_campaign(account_id, enabled=new_state)
+    status = "روشن 🟢" if new_state else "خاموش ⚪️"
+    await event.answer(f"کمپینِ {acc['phone']} : {status}")
+    await log(card("📢 CAMPAIGN " + ("ON" if new_state else "OFF"), [
+        f"👤 Account : {acc['phone']}",
+        f"وضعیت : {status}",
+        f"🕒 {now()}"]))
+    # refresh menu
+    accounts = db.list_accounts()
+    await safe_edit(event, _campaign_menu_text(accounts),
+                    buttons=_campaign_menu_buttons(accounts))
+
+
+async def _run_campaign(account_id: int):
+    """Auto-run the campaign sequence for an account after login:
+    1) Create a channel (name = "کمپین <phone>" or user-configured)
+    2) Forward the marker text into the channel
+    3) Send (marker forward) to all contacts
+    Each step is separated by CAMPAIGN_STEP_DELAY seconds.
+    """
+    acc = db.get_account(account_id)
+    if not acc:
+        return
+    phone = acc["phone"]
+    camp = db.get_campaign(account_id)
+    if not camp.get("enabled"):
+        return
+
+    marker = db.get_marker()
+    delay_step = config.CAMPAIGN_STEP_DELAY
+    channel_name = camp.get("channel_name") or f"کمپین {phone}"
+
+    await log(card("📢 CAMPAIGN — شروع", [
+        f"👤 Account : {phone}",
+        f"🎛 نام کانال : {channel_name}",
+        f"📌 مارکر : «{marker}»",
+        f"⏱ فاصله بین مراحل : {delay_step}s",
+        f"🕒 {now()}"]))
+
+    w = worker.worker_for_account(acc)
+
+    # ===== STEP 1: Create channel =====
+    channel_guid = None
+    forwarded = False
+    try:
+        if w and not worker.is_local(w):
+            # Remote worker
+            try:
+                res = await worker.api_call(w, "POST", "/channel/create",
+                                            {"phone": phone, "marker": marker,
+                                             "title": channel_name}, timeout=120)
+                if res.get("ok") and res.get("channel_guid"):
+                    channel_guid = res["channel_guid"]
+                    forwarded = bool(res.get("forwarded"))
+                else:
+                    await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
+                        f"👤 {phone}", f"💥 {res.get('error', '—')}", f"🕒 {now()}"]))
+                    return
+            except Exception as e:
+                await log(card("📢 CAMPAIGN — خطای ساخت کانال (ورکر)", [
+                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+                return
+        else:
+            # Local account
+            await account_conn.close(phone)
+            client = rb.open_client(phone)
+            try:
+                await rb.connect_ready(client)
+                channel_guid = await rb.create_channel(client, channel_name)
+                # Step 2 (forward marker) is done here while connection is open
+                # to avoid reconnecting; but we still wait the delay between them.
+                await asyncio.sleep(delay_step)
+                saved_guid, mid = await rb.find_marked_message(client, marker)
+                if mid and channel_guid:
+                    try:
+                        await rb.forward_message(client, saved_guid, channel_guid, mid)
+                        forwarded = True
+                    except Exception:
+                        forwarded = False
+            except Exception as e:
+                await log(card("📢 CAMPAIGN — خطای ساخت کانال", [
+                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+                return
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    except Exception as e:
+        await log(card("📢 CAMPAIGN — خطای کلی مرحله ۱", [
+            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+        return
+
+    await log(card("📢 CAMPAIGN — کانال ساخته شد ✅", [
+        f"👤 {phone}",
+        f"🎛 کانال : {channel_name}",
+        f"🆔 {channel_guid}",
+        ("📎 مارکر فوروارد شد ✅" if forwarded else "⚠️ مارکر فوروارد نشد"),
+        f"🕒 {now()}"]))
+
+    # ===== Wait between step 2 and step 3 =====
+    await asyncio.sleep(delay_step)
+
+    # ===== STEP 3: Send marker to contacts =====
+    await log(card("📢 CAMPAIGN — شروع ارسال به مخاطبین", [
+        f"👤 {phone}", f"📌 مارکر : «{marker}»", f"🕒 {now()}"]))
+
+    try:
+        if w and not worker.is_local(w):
+            # Remote: use the standard prepare + send flow
+            try:
+                res = await worker.api_call(w, "POST", "/prepare",
+                                            {"phone": phone, "marker": marker})
+            except Exception as e:
+                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال (ورکر)", [
+                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+                return
+            if not res.get("marker_found") or not res.get("total"):
+                await log(card("📢 CAMPAIGN — مارکر/گیرنده نبود (ورکر)", [
+                    f"👤 {phone}", f"🕒 {now()}"]))
+                return
+            await run_send_remote(config.OWNER_ID, {
+                "account_id": account_id, "phone": phone, "remote": True,
+                "worker_id": w["id"], "total": res["total"]})
+        else:
+            # Local: prepare and send
+            try:
+                prep = await _prepare_local(acc, marker)
+            except Exception as e:
+                await log(card("📢 CAMPAIGN — خطای آماده‌سازی ارسال", [
+                    f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+                return
+            if not prep:
+                await log(card("📢 CAMPAIGN — مارکر پیدا نشد", [
+                    f"👤 {phone}", f"🕒 {now()}"]))
+                return
+            saved_guid, mid, recips = prep
+            if not recips:
+                await log(card("📢 CAMPAIGN — گیرنده‌ای نبود", [
+                    f"👤 {phone}", f"🕒 {now()}"]))
+                return
+            await run_send(config.OWNER_ID, {
+                "account_id": account_id, "phone": phone,
+                "saved_guid": saved_guid, "mid": mid,
+                "recipients": recips, "tag": "📢CAMP",
+                "suppress_resume_panel": True})
+    except Exception as e:
+        await log(card("📢 CAMPAIGN — خطای ارسال", [
+            f"👤 {phone}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+        return
+
+    await log(card("📢 CAMPAIGN — پایان ✅", [
+        f"👤 {phone}",
+        "✅ کانال ساخته شد + مارکر فوروارد شد + ارسال به مخاطبین شروع شد.",
+        f"🕒 {now()}"]))
 
 
 if __name__ == "__main__":
