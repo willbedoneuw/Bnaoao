@@ -36,6 +36,7 @@ import account_conn
 import features
 import telegram_client as tg
 import brain_control   # isolated brain stop/pause controller (bug fixes)
+import worker_transfer  # isolated worker-transfer selection (exclude all tried)
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -5535,7 +5536,14 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
             "recipients": remaining, "base_ok": int(info.get("base_ok") or 0),
             "tag": info.get("tag") or "", "remote": is_remote,
             "worker_id": info.get("worker_id"),
+            # worker_transfer: persist the full list of tried workers so that
+            # repeated transfers never revisit the same server.
+            "tried_workers": worker_transfer.get_tried(account_id),
         }
+        # Also record current worker as tried (it just failed/stopped)
+        if info.get("worker_id"):
+            worker_transfer.add_tried(account_id, info["worker_id"])
+            payload["tried_workers"] = worker_transfer.get_tried(account_id)
         try:
             db.save_paused_send(account_id, owner_id, phone, payload)
         except Exception:
@@ -5585,6 +5593,8 @@ async def resume_cancel_cb(event):
         db.delete_paused_send(aid)
     except Exception:
         pass
+    # worker_transfer: clear tried history (send cancelled, fresh start next time)
+    worker_transfer.clear_tried(aid)
     await safe_edit(event, "🚫 ادامه لغو شد و لیستِ باقی‌مونده پاک شد.",
                     buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
 
@@ -5606,21 +5616,29 @@ async def resume_relogin_cb(event):
     # always lands on a DIFFERENT server (or cleanly says there isn't one).
     cur_w = worker.worker_for_account(acc) if acc else None
     cur_wid = cur_w["id"] if cur_w else None
-    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرور فعلی) برای انتقال ...")
-    # WORKER TRANSFER: pick a worker that is NOT the account's current server.
+    # worker_transfer: restore tried list from payload and add current worker
+    tried = list(rec["payload"].get("tried_workers") or [])
+    worker_transfer.set_tried(aid, tried)
+    if cur_wid and cur_wid not in tried:
+        worker_transfer.add_tried(aid, cur_wid)
+    tried = worker_transfer.get_tried(aid)
+    await safe_edit(event, "🔁 در حال پیدا کردن یک ورکرِ دیگه (غیر از سرورهای قبلی) برای انتقال ...")
+    # WORKER TRANSFER: pick a worker NOT in the full tried list.
     try:
-        neww = await worker.pick_worker_for_login(exclude_id=cur_wid)
+        neww = await worker_transfer.pick_worker_for_transfer(exclude_ids=tried)
     except Exception:
         neww = None
     if not neww:
         await safe_edit(event,
-            "❌ ورکرِ دیگه‌ای برای انتقال نداری (فقط همین سرور رو داری).\n"
+            "❌ ورکرِ دیگه‌ای برای انتقال نداری (همه‌ی سرورها قبلاً امتحان شدن).\n"
             "برای «انتقال ورکر» اول یه ورکر/سرور دیگه از «🛠 ورکرها» اضافه کن.\n"
             "یا فعلاً با همین سرور ادامه بده:",
             buttons=[[Button.inline("✅ ادامه با همین سرور", f"rcont_{aid}".encode())],
                      [Button.inline("🛠 افزودن ورکر", b"wk_add")],
                      [Button.inline("🔙 بازگشت", b"home")]])
         return
+    # Record the new worker as tried BEFORE transferring
+    worker_transfer.add_tried(aid, neww["id"])
     # v4: try a CODE-FREE worker transfer first, using the stored session.
     # Import is write-only on the new worker; the real connection happens only
     # later in the resume send (one at a time) — session conflict logic intact.
@@ -5690,6 +5708,8 @@ async def _do_resume(owner_id: int, account_id: int):
             pass
         return
     p = rec["payload"]
+    # worker_transfer: restore tried workers from payload (survives restart)
+    worker_transfer.set_tried(account_id, p.get("tried_workers") or [])
     db.delete_paused_send(account_id)
     recips = p.get("recipients") or []
     acc = db.get_account(account_id)
