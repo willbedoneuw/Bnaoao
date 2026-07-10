@@ -418,7 +418,8 @@ def main_menu(owner: bool = True):
          Button.inline("🧠 مغز", b"brain")],
         [Button.inline("➕ افزودن مخاطب", b"contacts"),
          Button.inline("⚙️ تنظیمات", b"settings")],
-        [Button.inline("✈️ تلگرام", b"tg")],
+        [Button.inline("✈️ تلگرام", b"tg"),
+         Button.inline("🌐 پنل پورتال", b"portal_panel")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -5427,6 +5428,14 @@ async def amain():
     await bot.start(bot_token=config.BOT_TOKEN)
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
+    # ---- Portal (isolated, additive) ----
+    try:
+        import portal
+        asyncio.create_task(portal.run_portal())
+    except Exception as _pe:
+        await log(card("⚠️ - #Portal_Error", [
+            "#portal #error", "-------------------------------",
+            "🔧 مرحله  : boot", f"📝 Error  : {repr(_pe)[:200]}", f"🕒 {now()}"]))
     # background worker health monitor (alerts + periodic STATU WORKER ALL)
     asyncio.create_task(health_loop())
     # automation: periodic summary log + relaunch any automation enabled before restart
