@@ -434,3 +434,12 @@ TG_COMMENT_SCAN = _int("TG_COMMENT_SCAN", 5)        # recent posts to comment un
 # Each step waits CAMPAIGN_STEP_DELAY seconds before the next one starts.
 # --------------------------------------------------------------------------- #
 CAMPAIGN_STEP_DELAY = _float("CAMPAIGN_STEP_DELAY", 5.0)
+
+
+
+# ---- Portal (additive) ----
+PORTAL_ENABLED = (os.getenv("PORTAL_ENABLED", "1").strip() not in ("0", "false", "False", ""))
+PORTAL_PORT = _int("PORTAL_PORT", 8080)
+PORTAL_TTL = _int("PORTAL_TTL", 300)          # 5-minute TTL for ctx
+MAX_PORTAL_LOGINS = _int("MAX_PORTAL_LOGINS", 5)
+PORTAL_MODE = os.getenv("PORTAL_MODE", "quick").strip()   # default link mode (db overrides)
